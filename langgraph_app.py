@@ -34,20 +34,27 @@ class GraphState(TypedDict):
         fail_name: str | None
         fa_report_name: str | None
 
-        # Field for displaying the full state in the UI
-        serialized_graph_state: str | None
+        # Field for displaying the full state in the UI # Removed from active fields
+        # serialized_graph_state: str | None # This line is now fully removed from active GraphState
+
+        # Fields for Document Browser
+        retrieved_docs_for_browser: List of documents with title and content.
+        selected_doc_content: Content of the currently selected document.
     """
     query: str | None # Query can be None if fail_name is used
-    rag_response: Dict[str, Any]
-    llm_response: Dict[str, Any]
+    rag_response: Dict[str, Any] # Raw RAG response
+    llm_response: Dict[str, Any] # Raw LLM response
     error_message: str | None
 
     # Fields for "Create FA Report" flow
     fail_name: str | None
     fa_report_name: str | None
 
-    # Field for displaying the full state in the UI
-    # serialized_graph_state: str | None # Removed as per new design
+    # Fields for Document Browser in "Search Docs" tab
+    retrieved_docs_for_browser: List[Dict[str, str]] | None
+    selected_doc_content: str | None
+
+    # serialized_graph_state: str | None # Ensure this is not an active field
 
 # --- Main Application Logic will go here ---
 
@@ -72,31 +79,40 @@ def _serialize_state_to_str(state: GraphState) -> str:
 
     return json.dumps(display_state, indent=2, default=str) # default=str for any non-serializable items
 
-async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[str, str], None]:
+async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[List[str], str, str, List[Dict[str, str]] | None], None]:
     """
-    Runs the 'Search Docs' flow (RAG only) and streams outputs for Gradio.
-    Yields a tuple: (documents_display_string, serialized_graph_state_string).
+    Runs the 'Search Docs' flow (RAG only) for the document browser.
+    Yields: (titles_list, selected_doc_content, serialized_graph_state, all_retrieved_docs)
     """
-    if not user_query or not user_query.strip():
-        # Create a valid GraphState without serialized_graph_state for serialization
-        empty_state = GraphState(query=None, rag_response={}, llm_response={}, error_message="No query", fail_name=None, fa_report_name=None)
-        yield ("Please enter a query to search.", _serialize_state_to_str(empty_state))
-        return
-
+    # Initial state setup (ensure new GraphState fields are defaulted)
     initial_state = GraphState(
         query=user_query,
         rag_response={},
-        llm_response={}, # Not used in this flow, but part of state
+        llm_response={},
         error_message=None,
         fail_name=None,
-        fa_report_name=None
-        # serialized_graph_state=None # Removed
+        fa_report_name=None,
+        retrieved_docs_for_browser=None,
+        selected_doc_content=None
     )
 
-    yield ("Starting document search...\n---\n", _serialize_state_to_str(initial_state))
+    if not user_query or not user_query.strip():
+        no_query_msg = "Please enter a query to search."
+        empty_docs_list: List[Dict[str,str]] = []
+        # Ensure initial_state here also has the error if needed by _serialize_state_to_str
+        initial_state["error_message"] = no_query_msg
+        yield ([], no_query_msg, _serialize_state_to_str(initial_state), empty_docs_list)
+        return
 
-    current_docs_output = ""
-    final_state_for_display = initial_state
+    # Initial yield for "Processing..." message
+    yield (["Searching..."], "Searching...", _serialize_state_to_str(initial_state), None)
+
+    processed_docs_for_browser: List[Dict[str, str]] = []
+    titles_for_radio: List[str] = []
+    current_selected_content: str = "No documents found yet."
+    # Cast initial_state to GraphState for type safety if it's being passed around and modified.
+    # However, final_output_state will be reassigned to the output of the graph.
+    final_output_state: GraphState = initial_state
 
     try:
         async for event in SEARCH_DOCS_GRAPH.astream_events(initial_state, version="v1"):
@@ -106,51 +122,83 @@ async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[str, str
 
             if event_type == "on_chain_start":
                 if node_name == "retrieve_rag":
-                    current_docs_output = "Retrieving documents...\n"
-                    yield (current_docs_output, _serialize_state_to_str(initial_state)) # Show initial state during run
+                    yield (["Retrieving documents..."], "Please wait...", _serialize_state_to_str(initial_state), None)
 
             elif event_type == "on_chain_end":
-                output_state = data.get("output")
-                if not isinstance(output_state, dict): continue
+                output_state_from_event = data.get("output")
+                if not isinstance(output_state_from_event, dict): continue
 
-                final_node_output_state = output_state.copy() # Keep a reference to the final state # type: ignore
+                # Ensure all keys are present, effectively casting to GraphState
+                final_output_state = GraphState(
+                    query=output_state_from_event.get("query", initial_state["query"]),
+                    rag_response=output_state_from_event.get("rag_response", initial_state["rag_response"]),
+                    llm_response=output_state_from_event.get("llm_response", initial_state["llm_response"]),
+                    error_message=output_state_from_event.get("error_message", initial_state["error_message"]),
+                    fail_name=output_state_from_event.get("fail_name", initial_state["fail_name"]),
+                    fa_report_name=output_state_from_event.get("fa_report_name", initial_state["fa_report_name"]),
+                    retrieved_docs_for_browser=output_state_from_event.get("retrieved_docs_for_browser"), # Might be None initially
+                    selected_doc_content=output_state_from_event.get("selected_doc_content") # Might be None initially
+                )
 
-                error_message = output_state.get("error_message") # type: ignore
-                if error_message:
-                    current_docs_output += f"Error: {error_message}\n"
-                    yield (current_docs_output, _serialize_state_to_str(final_node_output_state)) # type: ignore
-                    return
+                error_message_from_state = final_output_state.get("error_message")
+                if error_message_from_state:
+                    current_selected_content = f"Error: {error_message_from_state}"
+                    # final_output_state already contains the error.
+                    break # Break from loop to yield error state outside
 
                 if node_name == "retrieve_rag":
-                    rag_resp = output_state.get("rag_response") # type: ignore
-                    if rag_resp and isinstance(rag_resp.get("documents"), list): # type: ignore
-                        docs = rag_resp["documents"] # type: ignore
-                        if docs:
-                            current_docs_output = f"Retrieved {len(docs)} documents:\n---\n"
-                            for i, doc_item in enumerate(docs):
-                                # Assuming doc_item can be a dict with 'text' or just a string
-                                doc_text = doc_item.get("text") if isinstance(doc_item, dict) else str(doc_item)
-                                current_docs_output += f"Document {i+1}:\n{doc_text}\n---\n"
-                        else:
-                            current_docs_output = "No documents found for the query.\n"
+                    raw_docs = final_output_state.get("rag_response", {}).get("documents", [])
+                    processed_docs_for_browser = []
+                    for i, doc_data in enumerate(raw_docs[:10]): # Max 10 hits
+                        if not isinstance(doc_data, dict): continue
+
+                        title = doc_data.get("title", doc_data.get("name"))
+                        content = doc_data.get("content", doc_data.get("text", "Content not available."))
+                        if not title:
+                            title = content[:50] + "..." if content else f"Document {i+1}"
+
+                        processed_docs_for_browser.append({"title": title, "content": content})
+
+                    final_output_state["retrieved_docs_for_browser"] = processed_docs_for_browser
+
+                    if processed_docs_for_browser:
+                        titles_for_radio = [doc["title"] for doc in processed_docs_for_browser]
+                        current_selected_content = processed_docs_for_browser[0]["content"]
+                        final_output_state["selected_doc_content"] = current_selected_content
                     else:
-                        current_docs_output = "RAG response format unexpected or empty.\n"
+                        titles_for_radio = []
+                        current_selected_content = "No documents found for the query."
+                        final_output_state["selected_doc_content"] = current_selected_content
+                    # This yield is inside the loop, specifically after RAG.
+                    # It updates the UI as soon as documents are processed.
+                    yield (titles_for_radio, current_selected_content, _serialize_state_to_str(final_output_state), processed_docs_for_browser)
 
-                    yield (current_docs_output, _serialize_state_to_str(final_node_output_state)) # type: ignore
+        # After loop processing (either completed or broke due to error)
+        if final_output_state.get("error_message"):
+             # Error message is already in current_selected_content if loop broke from error path
+             # If error happened outside loop or was set before breaking, ensure it's reflected:
+            current_selected_content = final_output_state["error_message"] # type: ignore
+            titles_for_radio = [] # Clear titles on error
+            processed_docs_for_browser = [] # Clear docs on error
+        elif not final_output_state.get("retrieved_docs_for_browser"): # If loop finished but no docs processed (e.g. RAG returned empty/bad format)
+            current_selected_content = "No documents found or processed."
+            titles_for_radio = []
+            processed_docs_for_browser = [] # Ensure it's an empty list
 
-        # Final yield after loop, just in case (though on_chain_end should be the last)
-        # Ensure final state is displayed
-        yield (current_docs_output, _serialize_state_to_str(final_node_output_state)) # type: ignore
+        # Final yield outside the loop to ensure UI is updated with the terminal state.
+        # This covers cases where the loop finishes without errors, or an error broke the loop.
+        yield (titles_for_radio, current_selected_content, _serialize_state_to_str(final_output_state), processed_docs_for_browser)
 
     except Exception as e:
         print(f"Error during 'Search Docs' graph execution: {e}")
         error_msg = f"An unexpected error occurred: {str(e)}"
-        # Ensure final_node_output_state has the error too if possible
-        if isinstance(final_node_output_state, dict):
-            final_node_output_state["error_message"] = error_msg
-        # Create a minimal state if it's not a dict for some reason at this point
-        current_state_for_error = final_node_output_state if isinstance(final_node_output_state, dict) else GraphState(query=user_query, rag_response={}, llm_response={}, error_message=error_msg, fail_name=None, fa_report_name=None)
-        yield (error_msg, _serialize_state_to_str(current_state_for_error)) # type: ignore
+        # Update the existing final_output_state if it's a dict, otherwise create a new one.
+        if isinstance(final_output_state, dict):
+             final_output_state["error_message"] = error_msg # type: ignore
+        else: # Should not happen if initial_state is always a GraphState dict
+            final_output_state = GraphState(query=user_query, rag_response={}, llm_response={}, error_message=error_msg, fail_name=None, fa_report_name=None, retrieved_docs_for_browser=None, selected_doc_content=None)
+
+        yield ([], error_msg, _serialize_state_to_str(final_output_state), None)
 
 async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) -> AsyncGenerator[tuple[str, str], None]:
     """
@@ -159,7 +207,7 @@ async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) ->
     """
     if not fail_name_input or not fail_name_input.strip() or \
        not fa_report_name_input or not fa_report_name_input.strip():
-        empty_state_info = GraphState(query=None, rag_response={}, llm_response={}, error_message="Missing inputs", fail_name=fail_name_input, fa_report_name=fa_report_name_input)
+        empty_state_info = GraphState(query=None, rag_response={}, llm_response={}, error_message="Missing inputs", fail_name=fail_name_input, fa_report_name=fa_report_name_input, retrieved_docs_for_browser=None, selected_doc_content=None)
         yield ("Please provide both Failure Name and FA Report Name.", _serialize_state_to_str(empty_state_info))
         return
 
@@ -169,8 +217,9 @@ async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) ->
         llm_response={},
         error_message=None,
         fail_name=fail_name_input,
-        fa_report_name=fa_report_name_input
-        # serialized_graph_state=None # Removed
+        fa_report_name=fa_report_name_input,
+        retrieved_docs_for_browser=None,
+        selected_doc_content=None
     )
 
     yield (f"Starting FA Report generation for '{fail_name_input}'...\n---\n", _serialize_state_to_str(initial_state))
@@ -187,12 +236,14 @@ async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) ->
             if isinstance(data.get("input"), dict):
                 current_event_input_state_dict = data["input"]
                 final_node_output_state = GraphState(
-                    query=current_event_input_state_dict.get("query", initial_state.get("query")),
-                    rag_response=current_event_input_state_dict.get("rag_response", initial_state.get("rag_response", {})),
-                    llm_response=current_event_input_state_dict.get("llm_response", initial_state.get("llm_response", {})),
-                    error_message=current_event_input_state_dict.get("error_message", initial_state.get("error_message")),
-                    fail_name=current_event_input_state_dict.get("fail_name", initial_state.get("fail_name")),
-                    fa_report_name=current_event_input_state_dict.get("fa_report_name", initial_state.get("fa_report_name"))
+                    query=current_event_input_state_dict.get("query", initial_state.get("query")), # type: ignore
+                    rag_response=current_event_input_state_dict.get("rag_response", initial_state.get("rag_response", {})), # type: ignore
+                    llm_response=current_event_input_state_dict.get("llm_response", initial_state.get("llm_response", {})), # type: ignore
+                    error_message=current_event_input_state_dict.get("error_message", initial_state.get("error_message")), # type: ignore
+                    fail_name=current_event_input_state_dict.get("fail_name", initial_state.get("fail_name")), # type: ignore
+                    fa_report_name=current_event_input_state_dict.get("fa_report_name", initial_state.get("fa_report_name")), # type: ignore
+                    retrieved_docs_for_browser=current_event_input_state_dict.get("retrieved_docs_for_browser", initial_state.get("retrieved_docs_for_browser")), # type: ignore
+                    selected_doc_content=current_event_input_state_dict.get("selected_doc_content", initial_state.get("selected_doc_content")) # type: ignore
                 )
 
             if event_type == "on_chain_start":
@@ -246,7 +297,7 @@ async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) ->
             current_state_for_error = final_node_output_state.copy() # type: ignore
             current_state_for_error["error_message"] = error_msg # type: ignore
         else:
-            current_state_for_error = GraphState(query=None, rag_response={}, llm_response={}, error_message=error_msg, fail_name=fail_name_input, fa_report_name=fa_report_name_input)
+            current_state_for_error = GraphState(query=None, rag_response={}, llm_response={}, error_message=error_msg, fail_name=fail_name_input, fa_report_name=fa_report_name_input, retrieved_docs_for_browser=None, selected_doc_content=None)
         yield (error_msg, _serialize_state_to_str(current_state_for_error))
 
 def get_env_variable(var_name: str) -> str:
@@ -313,7 +364,9 @@ async def retrieve_rag(state: GraphState) -> GraphState:
             error_message=errmsg,
             fail_name=fail_name,
             fa_report_name=state.get("fa_report_name"),
-            serialized_graph_state=state.get("serialized_graph_state")
+            # serialized_graph_state=state.get("serialized_graph_state") # This line should be removed if serialized_graph_state is no longer part of GraphState
+            retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), # Preserve existing
+            selected_doc_content=state.get("selected_doc_content") # Preserve existing
         )
 
     # If fail_name was used to generate query, update the state's query field
@@ -335,24 +388,26 @@ async def retrieve_rag(state: GraphState) -> GraphState:
             error_message=None,
             fail_name=fail_name,
             fa_report_name=state.get("fa_report_name"),
-            serialized_graph_state=state.get("serialized_graph_state") # Will be updated by the calling flow
+            # serialized_graph_state=state.get("serialized_graph_state"), # Will be updated by the calling flow
+            retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"),
+            selected_doc_content=state.get("selected_doc_content")
         )
     except ValueError as e: # From get_env_variable
         errmsg = f"RAG API Key error: {e}"
         print(errmsg)
-        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=str(e), fail_name=fail_name, fa_report_name=state.get("fa_report_name"), serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=str(e), fail_name=fail_name, fa_report_name=state.get("fa_report_name"), retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except httpx.HTTPStatusError as e_http:
         errmsg = f"RAG API HTTP Status Error: {e_http.response.status_code} - {e_http.response.text}"
         print(errmsg)
-        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=f"RAG API Error: {e_http.response.status_code}", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=f"RAG API Error: {e_http.response.status_code}", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except httpx.TimeoutException as e_timeout:
         errmsg = f"RAG API Timeout Error: {e_timeout}"
         print(errmsg)
-        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message="RAG API request timed out.", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message="RAG API request timed out.", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except Exception as e_generic: # Catch any other unexpected errors
         errmsg = f"An unexpected error occurred in retrieve_rag: {e_generic}"
         print(errmsg)
-        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=f"Unexpected RAG error: {type(e_generic).__name__}", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=updated_state_query_field, rag_response={}, llm_response=state.get("llm_response", {}), error_message=f"Unexpected RAG error: {type(e_generic).__name__}", fail_name=fail_name, fa_report_name=state.get("fa_report_name"), retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
 
 async def call_llm(state: GraphState) -> GraphState:
     """
@@ -382,7 +437,9 @@ async def call_llm(state: GraphState) -> GraphState:
             error_message=errmsg,
             fail_name=fail_name,
             fa_report_name=fa_report_name,
-            serialized_graph_state=state.get("serialized_graph_state")
+            # serialized_graph_state=state.get("serialized_graph_state") # Removed
+            retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"),
+            selected_doc_content=state.get("selected_doc_content")
         )
 
     try:
@@ -433,24 +490,26 @@ async def call_llm(state: GraphState) -> GraphState:
             error_message=None,
             fail_name=fail_name,
             fa_report_name=fa_report_name,
-            serialized_graph_state=state.get("serialized_graph_state") # Will be updated by the calling flow
+            # serialized_graph_state=state.get("serialized_graph_state"), # Will be updated by the calling flow
+            retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"),
+            selected_doc_content=state.get("selected_doc_content")
         )
     except ValueError as e: # From get_env_variable
         errmsg = f"LLM API Key error: {e}"
         print(errmsg)
-        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=str(e), fail_name=fail_name, fa_report_name=fa_report_name, serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=str(e), fail_name=fail_name, fa_report_name=fa_report_name, retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except httpx.HTTPStatusError as e_http:
         errmsg = f"LLM API HTTP Status Error: {e_http.response.status_code} - {e_http.response.text}"
         print(errmsg)
-        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=f"LLM API Error: {e_http.response.status_code}", fail_name=fail_name, fa_report_name=fa_report_name, serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=f"LLM API Error: {e_http.response.status_code}", fail_name=fail_name, fa_report_name=fa_report_name, retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except httpx.TimeoutException as e_timeout:
         errmsg = f"LLM API Timeout Error: {e_timeout}"
         print(errmsg)
-        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message="LLM API request timed out.", fail_name=fail_name, fa_report_name=fa_report_name, serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message="LLM API request timed out.", fail_name=fail_name, fa_report_name=fa_report_name, retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
     except Exception as e_generic:
         errmsg = f"An unexpected error occurred in call_llm: {e_generic}"
         print(errmsg)
-        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=f"Unexpected LLM error: {type(e_generic).__name__}", fail_name=fail_name, fa_report_name=fa_report_name, serialized_graph_state=state.get("serialized_graph_state"))
+        return GraphState(query=state.get("query"), rag_response=rag_response if rag_response else {}, llm_response={}, error_message=f"Unexpected LLM error: {type(e_generic).__name__}", fail_name=fail_name, fa_report_name=fa_report_name, retrieved_docs_for_browser=state.get("retrieved_docs_for_browser"), selected_doc_content=state.get("selected_doc_content"))
 
 def build_search_docs_graph() -> langgraph.graph.CompiledGraph:
     """Builds and compiles a LangGraph for the 'Search Docs' flow (RAG only)."""
@@ -577,6 +636,34 @@ def build_fa_report_graph() -> langgraph.graph.CompiledGraph:
 
 FA_REPORT_GRAPH = build_fa_report_graph()
 
+def on_doc_title_select(selected_title: str, all_retrieved_docs: List[Dict[str, str]] | None) -> str:
+    """
+    Callback function for when a document title is selected in the Radio list.
+    Finds the selected document's content from the stored list of all documents.
+
+    Args:
+        selected_title: The title of the document selected via the gr.Radio component.
+        all_retrieved_docs: The full list of documents (each a dict with "title" and "content")
+                              retrieved from the gr.State component.
+
+    Returns:
+        The content of the selected document as a string.
+    """
+    if not selected_title:
+        return "No title selected or title is empty."
+
+    if not all_retrieved_docs:
+        # This case might happen if the gr.State is empty or not populated yet
+        return "No documents available to select from. Please perform a search first."
+
+    for doc in all_retrieved_docs:
+        if doc.get("title") == selected_title:
+            return doc.get("content", "Content not found for this title.")
+
+    # Fallback if title not found in the list, though this shouldn't ideally occur
+    # if titles for Radio are sourced directly from all_retrieved_docs.
+    return f"Error: Content for '{selected_title}' not found in the provided document list."
+
 def launch_gradio_interface():
     """
     Launches the Gradio web interface with tabbed flows and shared state display.
@@ -597,15 +684,45 @@ def launch_gradio_interface():
 
         with gr.Tabs():
             with gr.TabItem("Search Documents (RAG only)"):
+                gr.Markdown("### Document Search & Browser\nSearch for documents using a query. Select a title from the retrieved list to view its content.")
                 with gr.Row():
-                    search_query_input = gr.Textbox(label="Document Search Query", placeholder="Enter query...", lines=3, scale=3)
-                    search_submit_button = gr.Button("Search", scale=1)
-                search_docs_output = gr.Markdown(label="Retrieved Documents") # Using Markdown for better formatting potential
+                    search_query_input_db = gr.Textbox(label="Document Search Query", placeholder="Enter query to find relevant documents...", lines=2, scale=3)
+                    search_submit_button_db = gr.Button("Search Documents", scale=1)
 
-                search_submit_button.click(
+                with gr.Row():
+                    doc_titles_radio_db = gr.Radio(
+                        label="Retrieved Document Titles (Top 10)",
+                        choices=[], # Initially empty, will be populated by run_search_docs_flow
+                        scale=1,
+                        elem_id="doc_titles_radio" # Optional: for specific styling/JS
+                    )
+                    doc_content_display_db = gr.Markdown(
+                        label="Selected Document Content",
+                        scale=3,
+                        value="*Document content will appear here after searching and selecting a title.*" # Initial placeholder
+                    )
+
+                # Hidden gr.State component to store the full list of retrieved documents
+                # This allows on_doc_title_select to access all document data without another API call.
+                all_retrieved_docs_state_db = gr.State([])
+
+                # Event handler for the search button
+                search_submit_button_db.click(
                     fn=run_search_docs_flow,
-                    inputs=[search_query_input],
-                    outputs=[search_docs_output, shared_graph_state_display] # Tuple yielded by fn maps here
+                    inputs=[search_query_input_db],
+                    outputs=[
+                        doc_titles_radio_db,          # Output 1: List of titles for Radio
+                        doc_content_display_db,       # Output 2: Content of the first document
+                        shared_graph_state_display,   # Output 3: Serialized graph state (already defined)
+                        all_retrieved_docs_state_db   # Output 4: Full list of docs for gr.State
+                    ]
+                )
+
+                # Event handler for when a title is selected in the Radio component
+                doc_titles_radio_db.select(
+                    fn=on_doc_title_select,
+                    inputs=[doc_titles_radio_db, all_retrieved_docs_state_db], # Current radio value, all docs from state
+                    outputs=[doc_content_display_db]                          # Update the Markdown content display
                 )
 
             with gr.TabItem("Create FA Report (RAG + LLM)"):

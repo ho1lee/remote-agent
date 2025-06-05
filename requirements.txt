@@ -1,1 +1,6 @@
 pandas
+langgraph>=0.0.20
+httpx
+gradio
+tenacity
+python-dotenv

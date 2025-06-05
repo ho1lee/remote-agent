@@ -698,7 +698,6 @@ def launch_gradio_interface():
                     )
                     doc_content_display_db = gr.Markdown(
                         label="Selected Document Content",
-                        scale=3,
                         value="*Document content will appear here after searching and selecting a title.*" # Initial placeholder
                     )
 

@@ -79,10 +79,10 @@ def _serialize_state_to_str(state: GraphState) -> str:
 
     return json.dumps(display_state, indent=2, default=str) # default=str for any non-serializable items
 
-async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[List[str], str, str, List[Dict[str, str]] | None], None]:
+async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[Any, str, str, List[Dict[str, str]] | None], None]: # Changed first element of tuple to Any for gr.update
     """
     Runs the 'Search Docs' flow (RAG only) for the document browser.
-    Yields: (titles_list, selected_doc_content, serialized_graph_state, all_retrieved_docs)
+    Yields: (gr.update_for_radio, selected_doc_content, serialized_graph_state, all_retrieved_docs)
     """
     initial_state = GraphState(
         query=user_query, rag_response={}, llm_response={}, error_message=None,
@@ -92,33 +92,35 @@ async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[List[str
     if not user_query or not user_query.strip():
         no_query_msg = "Please enter a query to search."
         initial_state["error_message"] = no_query_msg
-        yield ([], no_query_msg, _serialize_state_to_str(initial_state), [])
+        yield (gr.update(choices=[], value=None), no_query_msg, _serialize_state_to_str(initial_state), [])
         return
 
-    yield (["Searching..."], "Searching...", _serialize_state_to_str(initial_state), None)
+    # Initial yield for "Processing..." message
+    # Content area shows "Searching...", radio is empty.
+    yield (gr.update(choices=[], value=None), "Searching...", _serialize_state_to_str(initial_state), None)
 
     processed_docs_list: List[Dict[str, str]] = []
-    titles_list: List[str] = []
+    titles_list: List[str] = [] # Renamed from titles_for_radio for clarity inside function
     selected_content: str = "Processing..."
-
     current_graph_state: GraphState = initial_state
     data_processed_for_node = False
 
     try:
         async for event in SEARCH_DOCS_GRAPH.astream_events(initial_state, version="v1"):
             event_type = event["event"]
-            node_name = event["name"] # Should be 'retrieve_rag' for this graph
+            node_name = event["name"]
             data = event.get("data", {})
 
             if event_type == "on_chain_start":
                 data_processed_for_node = False
-                selected_content = "Retrieving documents..."
-                titles_list = ["Retrieving..."]
-                yield (titles_list, selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
+                if node_name == "retrieve_rag":
+                    selected_content = "Retrieving documents..."
+                    # Radio choices remain empty, value None
+                    yield (gr.update(choices=[], value=None), selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
 
             elif event_type == "on_chain_stream":
                 chunk = data.get("chunk")
-                if isinstance(chunk, dict) and node_name == "retrieve_rag": # Check if chunk is our GraphState
+                if isinstance(chunk, dict) and node_name == "retrieve_rag":
                     current_graph_state = chunk.copy() # type: ignore
                     data_processed_for_node = True
 
@@ -127,15 +129,16 @@ async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[List[str
                         selected_content = f"Error: {error_msg_from_state}"
                         titles_list = []
                         processed_docs_list = []
-                        yield (titles_list, selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
+                        yield (gr.update(choices=[], value=None), selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
                         return
 
                     raw_docs = current_graph_state.get("rag_response", {}).get("documents", [])
-                    processed_docs_list = []
+                    processed_docs_list = [] # Reset for current processing
                     for i, doc_data in enumerate(raw_docs[:10]):
                         if not isinstance(doc_data, dict): continue
-                        title = doc_data.get("title", doc_data.get("name", content[:50] + "..." if (content := doc_data.get("content", doc_data.get("text", ""))) else f"Document {i+1}"))
-                        content = doc_data.get("content", doc_data.get("text", "Content not available."))
+                        _content_val = doc_data.get("content", doc_data.get("text", ""))
+                        title = doc_data.get("title", doc_data.get("name", _content_val[:50] + "..." if _content_val else f"Document {i+1}"))
+                        content = _content_val if _content_val else "Content not available."
                         processed_docs_list.append({"title": title, "content": content})
 
                     current_graph_state["retrieved_docs_for_browser"] = processed_docs_list
@@ -148,24 +151,23 @@ async def run_search_docs_flow(user_query: str) -> AsyncGenerator[tuple[List[str
                         selected_content = "No documents found."
                         current_graph_state["selected_doc_content"] = selected_content
 
-                    yield (titles_list, selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
+                    yield (gr.update(choices=titles_list, value=titles_list[0] if titles_list else None), selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
 
             elif event_type == "on_chain_end":
-                if not data_processed_for_node and isinstance(data.get("output"), dict):
-                    current_graph_state = data["output"].copy() # type: ignore
-                    print(f"Warning: Data for {node_name} processed from on_chain_end, not on_chain_stream.")
-
                 if node_name == "retrieve_rag":
-                    yield (titles_list, selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
+                    if not data_processed_for_node and isinstance(data.get("output"), dict) :
+                        print(f"Note: on_chain_end for {node_name} reached, data_processed_for_node is False. Yielding potentially stale data for radio/content if stream failed silently.")
+                    yield (gr.update(choices=titles_list, value=titles_list[0] if titles_list else None), selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
 
-        yield (titles_list, selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
+
+        yield (gr.update(choices=titles_list, value=titles_list[0] if titles_list else None), selected_content, _serialize_state_to_str(current_graph_state), processed_docs_list)
 
     except Exception as e:
         print(f"Error in run_search_docs_flow: {e}")
         error_msg = f"An unexpected error occurred: {str(e)}"
         if not isinstance(current_graph_state, dict): current_graph_state = initial_state.copy() # type: ignore
         current_graph_state["error_message"] = error_msg # type: ignore
-        yield ([], error_msg, _serialize_state_to_str(current_graph_state), None)
+        yield (gr.update(choices=[], value=None), error_msg, _serialize_state_to_str(current_graph_state), None)
 
 async def run_fa_report_flow(fail_name_input: str, fa_report_name_input: str) -> AsyncGenerator[tuple[str, str], None]:
     """
